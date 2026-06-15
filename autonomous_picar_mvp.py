@@ -11,25 +11,62 @@ The code expects the hardware-specific ``picarx`` package to be installed on
 Raspberry Pi hardware. See README.md for setup and safety notes.
 """
 
+import argparse
 import time
 
 import cv2
 import numpy as np
-from picarx import Picarx
+
+try:
+    from picarx import Picarx
+except ImportError:
+    Picarx = None
 
 
 # -----------------------------------------------------------------------------
 # Hardware setup
 # -----------------------------------------------------------------------------
 
-try:
-    px = Picarx()
-except Exception as exc:
-    raise RuntimeError(
-        "Could not initialize Picarx. Make sure the PiCar/PiCar-X hardware "
-        "library is installed, the script is running on the Raspberry Pi, and "
-        "the robot hardware is connected. Original error: " + str(exc)
-    ) from exc
+px = None
+DRY_RUN = False
+
+
+def init_robot(dry_run=False):
+    """Initialize PiCar hardware unless dry-run mode is requested."""
+    global px, DRY_RUN
+    DRY_RUN = dry_run
+
+    if DRY_RUN:
+        print("Dry-run mode: motor and steering commands will be printed only.")
+
+    if Picarx is None:
+        if DRY_RUN:
+            print(
+                "Warning: picarx is not installed, so dry-run mode will use "
+                f"{UNKNOWN_DISTANCE_CM} cm as the ultrasonic fallback."
+            )
+            return
+        raise RuntimeError(
+            "Could not import picarx. Install the PiCar/PiCar-X hardware "
+            "library on the Raspberry Pi, or use --dry-run for camera and "
+            "vision testing without motor movement."
+        )
+
+    try:
+        px = Picarx()
+    except Exception as exc:
+        if DRY_RUN:
+            print(
+                "Warning: could not initialize Picarx in dry-run mode, so "
+                f"ultrasonic readings will use {UNKNOWN_DISTANCE_CM} cm. "
+                f"Original error: {exc}"
+            )
+            return
+        raise RuntimeError(
+            "Could not initialize Picarx. Make sure the PiCar/PiCar-X hardware "
+            "library is installed, the script is running on the Raspberry Pi, and "
+            "the robot hardware is connected. Original error: " + str(exc)
+        ) from exc
 
 
 # -----------------------------------------------------------------------------
@@ -78,6 +115,9 @@ UNKNOWN_DISTANCE_CM = 999
 
 def stop():
     """Stop the drive motors."""
+    if DRY_RUN:
+        print("DRY RUN motor command: stop()")
+        return
     px.stop()
 
 
@@ -92,6 +132,14 @@ def drive(speed, steering_angle):
             expected steering range.
     """
     steering_angle = max(-MAX_STEERING, min(MAX_STEERING, steering_angle))
+
+    if DRY_RUN:
+        print(
+            "DRY RUN motor command: "
+            f"speed={speed}, steering_angle={steering_angle:.1f}"
+        )
+        return
+
     px.set_dir_servo_angle(steering_angle)
 
     if speed > 0:
@@ -110,6 +158,13 @@ def get_distance_cm():
         ``UNKNOWN_DISTANCE_CM`` is returned so a temporary bad reading does not
         crash the program.
     """
+    if px is None:
+        print(
+            "Warning: ultrasonic hardware is not available; "
+            f"using {UNKNOWN_DISTANCE_CM} cm fallback."
+        )
+        return UNKNOWN_DISTANCE_CM
+
     try:
         distance = px.ultrasonic.read()
         if distance is None:
@@ -268,8 +323,25 @@ def handle_right_sign():
 # Main program loop
 # -----------------------------------------------------------------------------
 
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description="Run the autonomous PiCar MVP.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Run camera, lane detection, sign detection, and ultrasonic fallback "
+            "while printing intended motor commands without moving motors."
+        ),
+    )
+    return parser.parse_args()
+
+
 def main():
     """Run the autonomous driving loop until the user stops the program."""
+    args = parse_args()
+    init_robot(dry_run=args.dry_run)
+
     cap = cv2.VideoCapture(CAMERA_ID)
 
     if not cap.isOpened():
