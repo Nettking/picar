@@ -21,10 +21,86 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 python3 -c "from picarx import Picarx; print('picarx is installed')"
+python3 autonomous_picar_mvp.py --dry-run
+python3 hardware_check.py
 python3 autonomous_picar_mvp.py
 ```
 
 Stop the program at any time with **CTRL+C**. If a display window is open, you can also press **q** while the OpenCV window is focused.
+
+
+## Safe First-Run Procedure
+
+Use this order the first time you set up a car or after changing wiring, camera angle, lane tape, signs, or tuning values:
+
+1. Put the car on a stable stand or blocks so the wheels cannot touch the floor.
+2. Keep hands, hair, cables, and loose clothing away from the wheels and steering linkage.
+3. Install dependencies and confirm the PiCar hardware library imports.
+4. Run the vision-only dry run:
+
+   ```bash
+   python3 autonomous_picar_mvp.py --dry-run
+   ```
+
+5. Run the guided hardware check and press **Enter** only when the car is lifted and the area is clear:
+
+   ```bash
+   python3 hardware_check.py
+   ```
+
+6. Run the vision calibration tool and adjust lighting, lane tape, signs, and thresholds before driving:
+
+   ```bash
+   python3 calibrate_vision.py
+   ```
+
+7. Start autonomous driving at low speed in a clear test area. Stay close enough to press **CTRL+C** immediately.
+
+## Dry-Run Mode
+
+Dry-run mode runs the camera loop, lane detection, sign detection, and ultrasonic distance read when the PiCar library and sensor are available. It prints the motor and steering commands it would send, but it does not move the motors or steering servo.
+
+```bash
+python3 autonomous_picar_mvp.py --dry-run
+```
+
+Use this before every classroom run to check that the camera sees the lane and signs and that the intended commands look reasonable. Press **q** in an OpenCV window or **CTRL+C** in the terminal to stop.
+
+## Hardware Check Script
+
+`hardware_check.py` is a guided, low-speed hardware test. It checks the camera and ultrasonic sensor, then asks for **Enter** before each steering or motor movement:
+
+```bash
+python3 hardware_check.py
+```
+
+Expected movement sequence:
+
+1. Steering left.
+2. Steering center.
+3. Steering right.
+4. Steering center.
+5. Forward at very low speed.
+6. Stop.
+
+Keep the car on blocks for this test. If anything moves the wrong way, stop with **CTRL+C** and fix the hardware or library configuration before autonomous driving.
+
+## Vision Calibration Script
+
+`calibrate_vision.py` shows four OpenCV windows:
+
+- `camera`: raw camera feed
+- `lane mask`: white lane pixels used for lane following
+- `red sign mask`: red pixels used for STOP detection
+- `blue sign mask`: blue pixels used for RIGHT TURN detection
+
+Run it with:
+
+```bash
+python3 calibrate_vision.py
+```
+
+The terminal prints `red_area`, `blue_area`, and `lane_error`. Use those values to tune sign size, lighting, camera angle, lane tape, and HSV thresholds. Press **q** in an OpenCV window or **CTRL+C** in the terminal to stop.
 
 ## What the Project Does
 
@@ -108,6 +184,12 @@ Before running on the floor, place the car on a stand or blocks so the wheels ca
 
 ```bash
 python3 autonomous_picar_mvp.py
+```
+
+For a no-movement safety preview, run:
+
+```bash
+python3 autonomous_picar_mvp.py --dry-run
 ```
 
 The script opens two OpenCV windows when a display is available:
