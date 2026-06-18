@@ -183,10 +183,25 @@ MAX_CONSECUTIVE_INVALID_DISTANCE_READS = 3
 STOP_COOLDOWN = 4
 RIGHT_COOLDOWN = 4
 
-# Minimum number of colored pixels required before a red or blue region counts
-# as a sign. Increase this to reduce false positives; decrease it if signs are
-# being missed.
+# Minimum number of red pixels required before a STOP sign is detected.
 SIGN_AREA_THRESHOLD = 1800
+
+# Blue RIGHT sign detection settings. These are deliberately stricter because a
+# false RIGHT detection starts a timed turn. Tune the HSV values first, then the
+# size and shape limits if needed.
+BLUE_HSV_LOWER = np.array([95, 100, 80])
+BLUE_HSV_UPPER = np.array([125, 255, 255])
+BLUE_MIN_CONTOUR_AREA = 800
+# Reject masks covering more than 8% of the ROI. At 640x480 this rejects the
+# previously observed background-like blue area of about 19,600 pixels.
+BLUE_MAX_ROI_RATIO = 0.08
+BLUE_MIN_FILL_RATIO = 0.25
+BLUE_MIN_ASPECT_RATIO = 0.4
+BLUE_MAX_ASPECT_RATIO = 2.5
+BLUE_MIN_WIDTH = 25
+BLUE_MIN_HEIGHT = 25
+BLUE_EDGE_MARGIN_RATIO = 0.05
+BLUE_MORPH_KERNEL_SIZE = 5
 
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
@@ -544,20 +559,31 @@ def calibrate_lane_thresholds(frame):
 # Vision: traffic sign detection
 # -----------------------------------------------------------------------------
 
-def detect_sign(frame):
-    """Detect simple red STOP and blue RIGHT TURN signs by color area.
+def make_blue_mask(hsv):
+    """Create a cleaned mask for saturated blue sign pixels."""
+    blue_mask = cv2.inRange(hsv, BLUE_HSV_LOWER, BLUE_HSV_UPPER)
+    kernel = np.ones(
+        (BLUE_MORPH_KERNEL_SIZE, BLUE_MORPH_KERNEL_SIZE),
+        dtype=np.uint8,
+    )
+    blue_mask = cv2.morphologyEx(blue_mask, cv2.MORPH_OPEN, kernel)
+    blue_mask = cv2.morphologyEx(blue_mask, cv2.MORPH_CLOSE, kernel)
+    return blue_mask
 
-    This MVP does not recognize shapes or text. It only counts red and blue
-    pixels in the upper/middle part of the image. Keep the test area simple and
-    avoid red or blue clutter in the background.
+
+def detect_sign(frame):
+    """Detect a red STOP sign or a plausible blue RIGHT TURN sign.
+
+    Red detection uses mask area. Blue detection uses the largest cleaned blue
+    contour and rejects tiny, oddly shaped, sparse, edge-cut, or
+    background-sized regions.
 
     Args:
         frame: BGR image from OpenCV.
 
     Returns:
-        ``(sign, red_area, blue_area)`` where ``sign`` is ``"STOP"``,
-        ``"RIGHT"``, or ``None``. The area values are useful for tuning
-        ``SIGN_AREA_THRESHOLD``.
+        ``(sign, red_area, blue_area, blue_debug)``. ``blue_debug`` contains
+        the mask ratio, largest contour measurements, and validation result.
     """
     h, _, _ = frame.shape
 
@@ -581,23 +607,65 @@ def detect_sign(frame):
 
     red_mask = red1 | red2
 
-    # Blue mask for a simple right-arrow sign.
-    blue_mask = cv2.inRange(
-        hsv,
-        np.array([90, 80, 60]),
-        np.array([130, 255, 255])
-    )
-
     red_area = cv2.countNonZero(red_mask)
+    blue_mask = make_blue_mask(hsv)
     blue_area = cv2.countNonZero(blue_mask)
+    roi_area = roi.shape[0] * roi.shape[1]
+    blue_roi_ratio = blue_area / roi_area if roi_area else 0.0
+
+    blue_debug = {
+        "ratio": blue_roi_ratio,
+        "contour_area": 0.0,
+        "width": 0,
+        "height": 0,
+        "aspect_ratio": 0.0,
+        "fill_ratio": 0.0,
+        "center_ok": False,
+        "valid": False,
+    }
+
+    contours, _ = cv2.findContours(
+        blue_mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+    if contours:
+        largest = max(contours, key=cv2.contourArea)
+        contour_area = cv2.contourArea(largest)
+        x, _, width, height = cv2.boundingRect(largest)
+        box_area = width * height
+        aspect_ratio = width / height if height else 0.0
+        fill_ratio = contour_area / box_area if box_area else 0.0
+        center_x = x + width / 2
+        edge_margin = roi.shape[1] * BLUE_EDGE_MARGIN_RATIO
+        center_ok = edge_margin <= center_x <= roi.shape[1] - edge_margin
+
+        blue_valid = (
+            contour_area > BLUE_MIN_CONTOUR_AREA
+            and blue_roi_ratio < BLUE_MAX_ROI_RATIO
+            and width >= BLUE_MIN_WIDTH
+            and height >= BLUE_MIN_HEIGHT
+            and BLUE_MIN_ASPECT_RATIO <= aspect_ratio <= BLUE_MAX_ASPECT_RATIO
+            and fill_ratio >= BLUE_MIN_FILL_RATIO
+            and center_ok
+        )
+        blue_debug.update({
+            "contour_area": contour_area,
+            "width": width,
+            "height": height,
+            "aspect_ratio": aspect_ratio,
+            "fill_ratio": fill_ratio,
+            "center_ok": center_ok,
+            "valid": blue_valid,
+        })
 
     if red_area > SIGN_AREA_THRESHOLD:
-        return "STOP", red_area, blue_area
+        return "STOP", red_area, blue_area, blue_debug
 
-    if blue_area > SIGN_AREA_THRESHOLD:
-        return "RIGHT", red_area, blue_area
+    if blue_debug["valid"]:
+        return "RIGHT", red_area, blue_area, blue_debug
 
-    return None, red_area, blue_area
+    return None, red_area, blue_area, blue_debug
 
 
 # -----------------------------------------------------------------------------
@@ -1030,7 +1098,7 @@ def main():
                 continue
 
             distance = get_distance_cm()
-            sign, red_area, blue_area = detect_sign(frame)
+            sign, red_area, blue_area, blue_debug = detect_sign(frame)
             with state_lock:
                 thresholds = shared_state["thresholds"].copy()
                 autonomous_active = shared_state["autonomous_active"]
@@ -1134,7 +1202,14 @@ def main():
             print(
                 f"distance={distance_text} | "
                 f"error={error} | steering={steering:.1f} | "
-                f"red={red_area} | blue={blue_area}"
+                f"red={red_area} | blue_area={blue_area} | "
+                f"blue_ratio={blue_debug['ratio']:.3f} | "
+                f"blue_contour={blue_debug['contour_area']:.0f} | "
+                f"blue_box={blue_debug['width']}x{blue_debug['height']} | "
+                f"blue_aspect={blue_debug['aspect_ratio']:.2f} | "
+                f"blue_fill={blue_debug['fill_ratio']:.2f} | "
+                f"blue_center={blue_debug['center_ok']} | "
+                f"blue_valid={blue_debug['valid']}"
             )
 
             if not args.web:

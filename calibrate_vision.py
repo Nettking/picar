@@ -3,7 +3,13 @@
 import cv2
 import numpy as np
 
-from autonomous_picar_mvp import CAMERA_ID, Camera, detect_lane
+from autonomous_picar_mvp import (
+    CAMERA_ID,
+    Camera,
+    detect_lane,
+    detect_sign,
+    make_blue_mask,
+)
 
 
 def make_sign_masks(frame):
@@ -15,7 +21,7 @@ def make_sign_masks(frame):
     red1 = cv2.inRange(hsv, np.array([0, 100, 80]), np.array([10, 255, 255]))
     red2 = cv2.inRange(hsv, np.array([170, 100, 80]), np.array([180, 255, 255]))
     red_mask = red1 | red2
-    blue_mask = cv2.inRange(hsv, np.array([90, 80, 60]), np.array([130, 255, 255]))
+    blue_mask = make_blue_mask(hsv)
 
     return red_mask, blue_mask
 
@@ -37,10 +43,13 @@ def main():
             lane_error, lane_mask = detect_lane(frame)
             red_mask, blue_mask = make_sign_masks(frame)
             red_area = cv2.countNonZero(red_mask)
-            blue_area = cv2.countNonZero(blue_mask)
+            _, _, blue_area, blue_debug = detect_sign(frame)
 
             print(
                 f"red_area={red_area} | blue_area={blue_area} | "
+                f"blue_ratio={blue_debug['ratio']:.3f} | "
+                f"blue_contour={blue_debug['contour_area']:.0f} | "
+                f"blue_valid={blue_debug['valid']} | "
                 f"lane_error={lane_error}"
             )
 
