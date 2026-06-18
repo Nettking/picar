@@ -12,6 +12,7 @@ Raspberry Pi hardware. See README.md for setup and safety notes.
 """
 
 import argparse
+import importlib
 import math
 import threading
 import time
@@ -34,7 +35,6 @@ try:
 except ImportError:
     Button = None
 
-
 # -----------------------------------------------------------------------------
 # Hardware setup
 # -----------------------------------------------------------------------------
@@ -44,6 +44,30 @@ DRY_RUN = False
 gpio_stop_latched = threading.Event()
 gpio_stop_button = None
 motor_lock = threading.RLock()
+state_lock = threading.RLock()
+web_server_failed = threading.Event()
+flask = None
+
+DEFAULT_THRESHOLDS = {
+    "h_min": 0,
+    "s_min": 0,
+    "v_min": 150,
+    "h_max": 180,
+    "s_max": 90,
+    "v_max": 255,
+}
+
+shared_state = {
+    "autonomous_active": False,
+    "distance_cm": None,
+    "detected_sign": None,
+    "lane_error": None,
+    "steering": 0.0,
+    "fault": None,
+    "raw_jpeg": None,
+    "mask_jpeg": None,
+    "thresholds": DEFAULT_THRESHOLDS.copy(),
+}
 
 
 def init_robot(dry_run=False, stop_gpio=None):
@@ -51,6 +75,19 @@ def init_robot(dry_run=False, stop_gpio=None):
     global px, DRY_RUN, gpio_stop_button
     DRY_RUN = dry_run
     gpio_stop_latched.clear()
+    web_server_failed.clear()
+    with state_lock:
+        shared_state.update({
+            "autonomous_active": False,
+            "distance_cm": None,
+            "detected_sign": None,
+            "lane_error": None,
+            "steering": 0.0,
+            "fault": None,
+            "raw_jpeg": None,
+            "mask_jpeg": None,
+            "thresholds": DEFAULT_THRESHOLDS.copy(),
+        })
 
     if DRY_RUN:
         print("Dry-run mode: motor and steering commands will be printed only.")
@@ -183,8 +220,17 @@ def stop():
 
 def trigger_gpio_stop():
     """Latch the GPIO stop and immediately command the motor controller off."""
-    gpio_stop_latched.set()
+    latch_emergency_stop("GPIO emergency stop button pressed")
     print("GPIO EMERGENCY STOP BUTTON PRESSED: motors disabled.")
+
+
+def latch_emergency_stop(reason):
+    """Latch the single emergency-stop state used by GPIO, web, and faults."""
+    gpio_stop_latched.set()
+    with state_lock:
+        shared_state["autonomous_active"] = False
+        shared_state["steering"] = 0.0
+        shared_state["fault"] = reason
     stop()
 
 
@@ -287,16 +333,17 @@ def drive(speed, steering_angle):
     """
     steering_angle = max(-MAX_STEERING, min(MAX_STEERING, steering_angle))
 
-    if DRY_RUN:
-        print(
-            "DRY RUN motor command: "
-            f"speed={speed}, steering_angle={steering_angle:.1f}"
-        )
-        return
-
     with motor_lock:
-        if gpio_stop_latched.is_set():
-            stop()
+        with state_lock:
+            controls_enabled = shared_state["autonomous_active"]
+        if gpio_stop_latched.is_set() or not controls_enabled:
+            return
+
+        if DRY_RUN:
+            print(
+                "DRY RUN motor command: "
+                f"speed={speed}, steering_angle={steering_angle:.1f}"
+            )
             return
 
         px.set_dir_servo_angle(steering_angle)
@@ -350,7 +397,7 @@ def get_distance_cm():
 # Vision: lane detection
 # -----------------------------------------------------------------------------
 
-def detect_lane(frame):
+def detect_lane(frame, thresholds=None):
     """Find the horizontal lane offset using a white color mask.
 
     The function looks only at the lower part of the camera image because that
@@ -376,8 +423,14 @@ def detect_lane(frame):
 
     # White tape or bright lane markings. Tune these values if your lane color
     # or lighting is different.
-    lower_white = np.array([0, 0, 150])
-    upper_white = np.array([180, 90, 255])
+    if thresholds is None:
+        thresholds = DEFAULT_THRESHOLDS
+    lower_white = np.array([
+        thresholds["h_min"], thresholds["s_min"], thresholds["v_min"]
+    ])
+    upper_white = np.array([
+        thresholds["h_max"], thresholds["s_max"], thresholds["v_max"]
+    ])
     mask = cv2.inRange(hsv, lower_white, upper_white)
 
     # Remove tiny specks, then expand the remaining lane pixels slightly.
@@ -456,6 +509,145 @@ def detect_sign(frame):
 
 
 # -----------------------------------------------------------------------------
+# Optional Flask dashboard
+# -----------------------------------------------------------------------------
+
+DASHBOARD_HTML = """
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PiCar Dashboard</title>
+<style>
+body{font-family:system-ui,sans-serif;margin:0;background:#111827;color:#f9fafb}main{max-width:1050px;margin:auto;padding:20px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}.card{background:#1f2937;padding:16px;border-radius:10px}
+img{width:100%;background:#000;border-radius:6px}.status{display:grid;grid-template-columns:1fr 1fr;gap:8px}.status div{background:#374151;padding:8px;border-radius:5px}
+button{padding:12px 16px;margin:4px;border:0;border-radius:5px;font-weight:700;cursor:pointer}.start{background:#22c55e}.stop{background:#f59e0b}.emergency{background:#ef4444;color:white}
+label{display:grid;grid-template-columns:80px 1fr 45px;gap:8px;margin:8px 0;align-items:center}input{width:100%}.latched{color:#f87171;font-weight:700}
+</style></head><body><main><h1>PiCar Live Dashboard</h1>
+<p>Driving starts disabled. Test with the car lifted on blocks.</p><div class="grid">
+<section class="card"><h2>Camera</h2><img src="/video_feed" alt="Live camera"></section>
+<section class="card"><h2>Lane mask</h2><img src="/mask_feed" alt="Lane mask"></section>
+<section class="card"><h2>Status</h2><div class="status">
+<div>Distance: <b id="distance">--</b></div><div>Sign: <b id="sign">--</b></div>
+<div>Lane error: <b id="error">--</b></div><div>Steering: <b id="steering">--</b></div>
+<div>Autonomous: <b id="active">OFF</b></div><div>Emergency: <b id="emergency">clear</b></div>
+<div>Fault: <b id="fault">none</b></div></div>
+<p><button class="start" onclick="post('/api/start')">Start autonomous driving</button>
+<button class="stop" onclick="post('/api/stop')">Stop autonomous driving</button>
+<button class="emergency" onclick="post('/api/emergency_stop')">EMERGENCY STOP</button></p></section>
+<section class="card"><h2>Lane HSV thresholds</h2><div id="sliders"></div></section></div>
+<script>
+const defs=[['h_min','H min',0,180],['h_max','H max',0,180],['s_min','S min',0,255],['s_max','S max',0,255],['v_min','V min',0,255],['v_max','V max',0,255]];
+const sliders=document.getElementById('sliders');
+for(const [key,name,min,max] of defs){sliders.insertAdjacentHTML('beforeend',`<label>${name}<input id="${key}" type="range" min="${min}" max="${max}"><output id="${key}_out"></output></label>`);const el=document.getElementById(key);el.oninput=()=>{document.getElementById(key+'_out').value=el.value; updateConfig();};}
+let timer; function updateConfig(){clearTimeout(timer);timer=setTimeout(()=>post('/api/config',Object.fromEntries(defs.map(([k])=>[k,Number(document.getElementById(k).value)]))),100);}
+async function post(url,data){await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:data?JSON.stringify(data):null});refresh();}
+let initialized=false;async function refresh(){const s=await fetch('/api/status').then(r=>r.json());
+distance.textContent=s.distance_cm==null?'unavailable':s.distance_cm.toFixed(1)+' cm';sign.textContent=s.detected_sign||'none';error.textContent=s.lane_error==null?'none':s.lane_error;steering.textContent=s.steering.toFixed(1);active.textContent=s.autonomous_active?'ON':'OFF';emergency.textContent=s.emergency_stop?'LATCHED':'clear';emergency.className=s.emergency_stop?'latched':'';fault.textContent=s.fault||'none';
+if(!initialized){for(const [k] of defs){document.getElementById(k).value=s.thresholds[k];document.getElementById(k+'_out').value=s.thresholds[k];}initialized=true;}}
+refresh();setInterval(refresh,500);
+</script></main></body></html>
+"""
+
+
+def create_web_app():
+    """Create the small dashboard application around the shared robot state."""
+    if flask is None:
+        raise RuntimeError("Flask has not been loaded")
+
+    app = flask.Flask(__name__)
+
+    @app.get("/")
+    def dashboard():
+        return flask.render_template_string(DASHBOARD_HTML)
+
+    def stream_frames(key):
+        while not web_server_failed.is_set():
+            with state_lock:
+                jpeg = shared_state[key]
+            if jpeg is None:
+                time.sleep(0.05)
+                continue
+            yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
+            time.sleep(0.03)
+
+    @app.get("/video_feed")
+    def video_feed():
+        return flask.Response(stream_frames("raw_jpeg"), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+    @app.get("/mask_feed")
+    def mask_feed():
+        return flask.Response(stream_frames("mask_jpeg"), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+    @app.post("/api/start")
+    def start_autonomous():
+        with state_lock:
+            if gpio_stop_latched.is_set():
+                return flask.jsonify(ok=False, error="Emergency stop is latched"), 409
+            shared_state["autonomous_active"] = True
+            shared_state["fault"] = None
+        return flask.jsonify(ok=True)
+
+    @app.post("/api/stop")
+    def stop_autonomous():
+        with state_lock:
+            shared_state["autonomous_active"] = False
+            shared_state["steering"] = 0.0
+        stop()
+        return flask.jsonify(ok=True)
+
+    @app.post("/api/emergency_stop")
+    def emergency_stop():
+        latch_emergency_stop("Web emergency stop pressed")
+        return flask.jsonify(ok=True)
+
+    @app.post("/api/config")
+    def update_config():
+        values = flask.request.get_json(silent=True) or {}
+        limits = {"h_min": 180, "h_max": 180, "s_min": 255, "s_max": 255, "v_min": 255, "v_max": 255}
+        try:
+            updated = {key: max(0, min(limit, int(values[key]))) for key, limit in limits.items()}
+        except (KeyError, TypeError, ValueError):
+            return flask.jsonify(ok=False, error="All six HSV threshold values are required"), 400
+        if updated["h_min"] > updated["h_max"] or updated["s_min"] > updated["s_max"] or updated["v_min"] > updated["v_max"]:
+            return flask.jsonify(ok=False, error="Minimum thresholds cannot exceed maximums"), 400
+        with state_lock:
+            shared_state["thresholds"] = updated
+        return flask.jsonify(ok=True, thresholds=updated)
+
+    @app.get("/api/status")
+    def status():
+        with state_lock:
+            data = {key: value for key, value in shared_state.items() if key not in ("raw_jpeg", "mask_jpeg")}
+            data["emergency_stop"] = gpio_stop_latched.is_set()
+        return flask.jsonify(data)
+
+    return app
+
+
+def run_web_server():
+    """Run Flask in a background thread and fail safe if it exits."""
+    try:
+        create_web_app().run(host="0.0.0.0", port=5000, threaded=True, use_reloader=False)
+    finally:
+        web_server_failed.set()
+        with state_lock:
+            shared_state["autonomous_active"] = False
+        stop()
+
+
+def load_flask():
+    """Load Flask only when the optional web dashboard is requested."""
+    global flask
+    try:
+        flask = importlib.import_module("flask")
+    except ImportError as exc:
+        raise RuntimeError(
+            "The --web option requires Flask. Install it with "
+            "'python3 -m pip install -r requirements.txt'."
+        ) from exc
+
+
+# -----------------------------------------------------------------------------
 # Sign behaviors
 # -----------------------------------------------------------------------------
 
@@ -499,6 +691,11 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--web",
+        action="store_true",
+        help="Run the live Flask dashboard on port 5000; driving starts stopped.",
+    )
+    parser.add_argument(
         "--camera-backend",
         choices=("auto", "picamera2", "opencv"),
         default="auto",
@@ -537,10 +734,23 @@ def main():
             )
             return
 
+        if args.web:
+            load_flask()
+            threading.Thread(target=run_web_server, name="picar-web", daemon=True).start()
+            print("Web dashboard: http://<raspberry-pi-ip>:5000")
+        else:
+            with state_lock:
+                shared_state["autonomous_active"] = True
+
         while True:
             if gpio_stop_latched.is_set():
-                stop()
-                print("GPIO emergency stop is latched; exiting autonomous mode.")
+                if not args.web:
+                    print(
+                        "Emergency stop is latched; exiting autonomous mode."
+                    )
+                    break
+            if args.web and web_server_failed.is_set():
+                print("Web server stopped unexpectedly; exiting safely.")
                 break
 
             ret, frame = cap.read()
@@ -550,10 +760,26 @@ def main():
                     "Warning: camera opened but no frame was received. "
                     "Stopping motors and trying again."
                 )
-                stop()
+                latch_emergency_stop("Camera capture failed")
                 continue
 
             distance = get_distance_cm()
+            sign, red_area, blue_area = detect_sign(frame)
+            with state_lock:
+                thresholds = shared_state["thresholds"].copy()
+                autonomous_active = shared_state["autonomous_active"]
+                emergency_stop = gpio_stop_latched.is_set()
+            error, lane_mask = detect_lane(frame, thresholds)
+            raw_ok, raw_buffer = cv2.imencode(".jpg", frame)
+            mask_ok, mask_buffer = cv2.imencode(".jpg", lane_mask)
+            with state_lock:
+                shared_state.update({
+                    "distance_cm": distance,
+                    "detected_sign": sign,
+                    "lane_error": error,
+                    "raw_jpeg": raw_buffer.tobytes() if raw_ok else None,
+                    "mask_jpeg": mask_buffer.tobytes() if mask_ok else None,
+                })
 
             if distance is None:
                 if DRY_RUN:
@@ -577,6 +803,13 @@ def main():
                             "for safety. Check sensor power and trigger/echo "
                             "wiring."
                         )
+                        with state_lock:
+                            shared_state["autonomous_active"] = False
+                            shared_state["steering"] = 0.0
+                            shared_state["fault"] = (
+                                "Ultrasonic sensor unavailable after "
+                                f"{consecutive_invalid_distance_reads} readings"
+                            )
                         stop()
                         time.sleep(0.2)
                         continue
@@ -592,7 +825,15 @@ def main():
                 time.sleep(0.2)
                 continue
 
-            sign, red_area, blue_area = detect_sign(frame)
+            if not autonomous_active or emergency_stop:
+                if not args.web:
+                    cv2.imshow("camera", frame)
+                    cv2.imshow("lane mask", lane_mask)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
+                time.sleep(0.03)
+                continue
+
             now = time.time()
 
             if sign == "STOP" and now - last_stop_time > STOP_COOLDOWN:
@@ -605,8 +846,6 @@ def main():
                 last_right_time = now
                 continue
 
-            error, lane_mask = detect_lane(frame)
-
             if error is None:
                 print(
                     "Lane lost: driving slowly straight. Check lane tape, "
@@ -618,6 +857,8 @@ def main():
             steering = KP * error
             steering = max(-MAX_STEERING, min(MAX_STEERING, steering))
 
+            with state_lock:
+                shared_state["steering"] = steering
             drive(BASE_SPEED, steering)
 
             distance_text = (
@@ -629,12 +870,13 @@ def main():
                 f"red={red_area} | blue={blue_area}"
             )
 
-            cv2.imshow("camera", frame)
-            cv2.imshow("lane mask", lane_mask)
+            if not args.web:
+                cv2.imshow("camera", frame)
+                cv2.imshow("lane mask", lane_mask)
 
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                print("q pressed: exiting safely.")
-                break
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    print("q pressed: exiting safely.")
+                    break
 
     except KeyboardInterrupt:
         print("CTRL+C received: stopping safely.")
