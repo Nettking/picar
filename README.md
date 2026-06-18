@@ -350,3 +350,46 @@ Different kits may mount motors or servos differently. Check the PiCar library d
   obstacle detection can no longer be trusted. If failures repeat, check the
   ultrasonic sensor's power, trigger, and echo connections, then run
   `python3 hardware_check.py`.
+
+## Live Web Dashboard
+
+The optional Flask dashboard runs inside the same process as the camera and
+robot control loop. **For the first test, put the car on stable blocks with the
+wheels clear of the floor.** Start it at the intentionally low default speed:
+
+```bash
+python3 autonomous_picar_mvp.py --web
+```
+
+Then open this address from a computer or phone on the same network:
+
+```text
+http://<raspberry-pi-ip>:5000
+```
+
+The camera and processed lane mask are live immediately, but autonomous driving
+starts **off**. The page shows distance, detected sign, lane error, steering,
+autonomous state, emergency-stop state, and any active sensor/camera fault. Its
+HSV sliders update the white lane threshold while the program is running.
+
+- **Start autonomous driving** allows the existing loop to issue motor and
+  steering commands.
+- **Stop autonomous driving** immediately calls `stop()`, leaves driving
+  disabled, and keeps the camera and dashboard running.
+- **Emergency stop** immediately calls `stop()` and latches the stopped state.
+  The browser cannot clear this latch; restart the program after checking the
+  car and test area.
+
+Use dry-run and the dashboard together before enabling real motors:
+
+```bash
+python3 autonomous_picar_mvp.py --dry-run --web
+```
+
+The dashboard is intentionally local and minimal: it has no authentication or
+TLS, threshold changes are not saved after restart, and the sign detector and
+lane follower still use simple color thresholds. Do not expose port 5000 to the
+public internet. A browser button and GPIO callback are software safety aids,
+not replacements for a physical motor-power disconnect. If camera capture
+fails, the program disables autonomous driving and latches the emergency state;
+if the main loop or web server exits, the cleanup path calls `stop()`.
