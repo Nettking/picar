@@ -4,6 +4,7 @@ Run this before autonomous driving. The script asks for Enter before every
 motor or steering movement so students can keep the car lifted and clear.
 """
 
+import math
 import time
 
 from picarx import Picarx
@@ -47,7 +48,14 @@ def test_ultrasonic(px):
     print("\nTesting ultrasonic sensor...")
     try:
         distance = px.ultrasonic.read()
-        print(f"Ultrasonic reading: {distance} cm")
+        numeric_distance = float(distance)
+        if not math.isfinite(numeric_distance) or numeric_distance <= 0:
+            print(
+                f"Ultrasonic FAILED: invalid reading {distance!r} cm. "
+                "Check the trigger/echo wiring and sensor power."
+            )
+        else:
+            print(f"Ultrasonic reading: {distance} cm")
     except Exception as exc:
         print(f"Ultrasonic FAILED: {exc}")
 

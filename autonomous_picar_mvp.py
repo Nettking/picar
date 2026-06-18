@@ -12,6 +12,7 @@ Raspberry Pi hardware. See README.md for setup and safety notes.
 """
 
 import argparse
+import math
 import threading
 import time
 
@@ -58,7 +59,7 @@ def init_robot(dry_run=False, stop_gpio=None):
         if DRY_RUN:
             print(
                 "Warning: picarx is not installed, so dry-run mode will use "
-                f"{UNKNOWN_DISTANCE_CM} cm as the ultrasonic fallback."
+                "an unavailable ultrasonic reading."
             )
             return
         raise RuntimeError(
@@ -73,7 +74,7 @@ def init_robot(dry_run=False, stop_gpio=None):
         if DRY_RUN:
             print(
                 "Warning: could not initialize Picarx in dry-run mode, so "
-                f"ultrasonic readings will use {UNKNOWN_DISTANCE_CM} cm. "
+                "ultrasonic readings will be unavailable. "
                 f"Original error: {exc}"
             )
             return
@@ -131,6 +132,11 @@ KP = 0.08
 # this distance in centimeters.
 OBSTACLE_LIMIT_CM = 15
 
+# Stop after this many invalid ultrasonic readings in a row. One or two bad
+# reads can be transient; repeated failures mean obstacle detection cannot be
+# trusted and autonomous driving must fail safe.
+MAX_CONSECUTIVE_INVALID_DISTANCE_READS = 3
+
 # Minimum number of seconds between repeated reactions to the same type of sign.
 STOP_COOLDOWN = 4
 RIGHT_COOLDOWN = 4
@@ -139,10 +145,6 @@ RIGHT_COOLDOWN = 4
 # as a sign. Increase this to reduce false positives; decrease it if signs are
 # being missed.
 SIGN_AREA_THRESHOLD = 1800
-
-# Fallback distance used when the ultrasonic sensor has no usable reading. A
-# large value lets the car continue instead of stopping for a sensor glitch.
-UNKNOWN_DISTANCE_CM = 999
 
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
@@ -311,32 +313,37 @@ def get_distance_cm():
     """Read the ultrasonic distance sensor.
 
     Returns:
-        Distance in centimeters. If the sensor read fails or returns ``None``,
-        ``UNKNOWN_DISTANCE_CM`` is returned so a temporary bad reading does not
-        crash the program.
+        A positive, finite distance in centimeters. If the sensor read fails or
+        returns an invalid value (including the PiCar-X ``-1``/``-2`` error
+        sentinels), ``None`` is returned. The main loop tolerates brief glitches
+        but stops after repeated invalid readings.
     """
     if px is None:
-        print(
-            "Warning: ultrasonic hardware is not available; "
-            f"using {UNKNOWN_DISTANCE_CM} cm fallback."
-        )
-        return UNKNOWN_DISTANCE_CM
+        print("Warning: ultrasonic hardware is not available.")
+        return None
 
     try:
         distance = px.ultrasonic.read()
-        if distance is None:
+        try:
+            distance = float(distance)
+        except (TypeError, ValueError):
             print(
-                "Warning: ultrasonic sensor returned no reading; "
-                f"using {UNKNOWN_DISTANCE_CM} cm fallback."
+                f"Warning: ultrasonic sensor returned invalid reading "
+                f"{distance!r}."
             )
-            return UNKNOWN_DISTANCE_CM
+            return None
+
+        if not math.isfinite(distance) or distance <= 0:
+            print(
+                f"Warning: ultrasonic sensor returned invalid reading "
+                f"{distance:g} cm."
+            )
+            return None
+
         return distance
     except Exception as exc:
-        print(
-            "Warning: could not read ultrasonic sensor; "
-            f"using {UNKNOWN_DISTANCE_CM} cm fallback. Error: {exc}"
-        )
-        return UNKNOWN_DISTANCE_CM
+        print(f"Warning: could not read ultrasonic sensor. Error: {exc}")
+        return None
 
 
 # -----------------------------------------------------------------------------
@@ -518,6 +525,7 @@ def main():
     cap = None
     last_stop_time = 0
     last_right_time = 0
+    consecutive_invalid_distance_reads = 0
 
     try:
         cap = Camera(CAMERA_ID, backend=args.camera_backend)
@@ -547,7 +555,35 @@ def main():
 
             distance = get_distance_cm()
 
-            if distance < OBSTACLE_LIMIT_CM:
+            if distance is None:
+                if DRY_RUN:
+                    print(
+                        "Dry-run: ultrasonic reading unavailable; continuing "
+                        "vision processing without obstacle sensing."
+                    )
+                else:
+                    consecutive_invalid_distance_reads += 1
+                    print(
+                        "Ultrasonic reading unavailable "
+                        f"({consecutive_invalid_distance_reads}/"
+                        f"{MAX_CONSECUTIVE_INVALID_DISTANCE_READS} consecutive)."
+                    )
+                    if (
+                        consecutive_invalid_distance_reads
+                        >= MAX_CONSECUTIVE_INVALID_DISTANCE_READS
+                    ):
+                        print(
+                            "Ultrasonic sensor failure limit reached; stopping "
+                            "for safety. Check sensor power and trigger/echo "
+                            "wiring."
+                        )
+                        stop()
+                        time.sleep(0.2)
+                        continue
+            else:
+                consecutive_invalid_distance_reads = 0
+
+            if distance is not None and distance < OBSTACLE_LIMIT_CM:
                 print(
                     f"Obstacle detected at {distance:.1f} cm; stopping. "
                     f"Threshold is {OBSTACLE_LIMIT_CM} cm."
@@ -584,8 +620,11 @@ def main():
 
             drive(BASE_SPEED, steering)
 
+            distance_text = (
+                f"{distance:.1f} cm" if distance is not None else "unavailable"
+            )
             print(
-                f"distance={distance:.1f} cm | "
+                f"distance={distance_text} | "
                 f"error={error} | steering={steering:.1f} | "
                 f"red={red_area} | blue={blue_area}"
             )
