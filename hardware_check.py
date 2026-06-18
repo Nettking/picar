@@ -6,8 +6,10 @@ motor or steering movement so students can keep the car lifted and clear.
 
 import time
 
-import cv2
 from picarx import Picarx
+
+import autonomous_picar_mvp as robot
+from autonomous_picar_mvp import Camera, stop
 
 CAMERA_ID = 0
 LOW_TEST_SPEED = 10
@@ -24,9 +26,9 @@ def wait_for_enter(message):
 def test_camera():
     """Open the camera and capture one frame."""
     print("Testing camera...")
-    cap = cv2.VideoCapture(CAMERA_ID)
+    cap = Camera(CAMERA_ID)
     try:
-        if not cap.isOpened():
+        if not cap.is_opened():
             print(f"Camera FAILED: could not open CAMERA_ID={CAMERA_ID}.")
             return
 
@@ -57,6 +59,8 @@ def main():
     print("Keep hands, hair, cables, and loose clothing away from wheels.")
 
     px = Picarx()
+    robot.px = px
+    robot.DRY_RUN = False
 
     try:
         test_camera()
@@ -88,7 +92,7 @@ def main():
     except KeyboardInterrupt:
         print("\nCTRL+C received: stopping safely.")
     finally:
-        px.stop()
+        stop()
         px.set_dir_servo_angle(STEERING_CENTER)
         print("Motors stopped and steering centered.")
 

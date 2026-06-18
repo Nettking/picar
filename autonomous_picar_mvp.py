@@ -12,6 +12,7 @@ Raspberry Pi hardware. See README.md for setup and safety notes.
 """
 
 import argparse
+import threading
 import time
 
 import cv2
@@ -22,6 +23,16 @@ try:
 except ImportError:
     Picarx = None
 
+try:
+    from picamera2 import Picamera2
+except ImportError:
+    Picamera2 = None
+
+try:
+    from gpiozero import Button
+except ImportError:
+    Button = None
+
 
 # -----------------------------------------------------------------------------
 # Hardware setup
@@ -29,12 +40,16 @@ except ImportError:
 
 px = None
 DRY_RUN = False
+gpio_stop_latched = threading.Event()
+gpio_stop_button = None
+motor_lock = threading.RLock()
 
 
-def init_robot(dry_run=False):
+def init_robot(dry_run=False, stop_gpio=None):
     """Initialize PiCar hardware unless dry-run mode is requested."""
-    global px, DRY_RUN
+    global px, DRY_RUN, gpio_stop_button
     DRY_RUN = dry_run
+    gpio_stop_latched.clear()
 
     if DRY_RUN:
         print("Dry-run mode: motor and steering commands will be printed only.")
@@ -67,6 +82,27 @@ def init_robot(dry_run=False):
             "library is installed, the script is running on the Raspberry Pi, and "
             "the robot hardware is connected. Original error: " + str(exc)
         ) from exc
+
+    if stop_gpio is not None:
+        if Button is None:
+            raise RuntimeError(
+                "A hardware stop GPIO was requested, but gpiozero is not "
+                "installed. Install python3-gpiozero and python3-lgpio."
+            )
+        try:
+            gpio_stop_button = Button(stop_gpio, pull_up=True, bounce_time=0.05)
+            gpio_stop_button.when_pressed = trigger_gpio_stop
+        except Exception as exc:
+            stop()
+            raise RuntimeError(
+                f"Could not configure hardware stop on BCM GPIO {stop_gpio}. "
+                "Connect a normally-open button between that pin and ground. "
+                f"Original error: {exc}"
+            ) from exc
+        print(
+            f"GPIO emergency stop button armed on BCM GPIO {stop_gpio} "
+            "(button to ground)."
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -108,17 +144,133 @@ SIGN_AREA_THRESHOLD = 1800
 # large value lets the car continue instead of stopping for a sensor glitch.
 UNKNOWN_DISTANCE_CM = 999
 
+CAMERA_WIDTH = 640
+CAMERA_HEIGHT = 480
+
 
 # -----------------------------------------------------------------------------
 # Robot control helpers
 # -----------------------------------------------------------------------------
 
 def stop():
-    """Stop the drive motors."""
+    """Stop both drive motors using redundant hardware commands."""
     if DRY_RUN:
         print("DRY RUN motor command: stop()")
         return
-    px.stop()
+    if px is None:
+        return
+
+    errors = []
+    with motor_lock:
+        try:
+            px.stop()
+        except Exception as exc:
+            errors.append(f"stop(): {exc}")
+
+        set_motor_speed = getattr(px, "set_motor_speed", None)
+        if callable(set_motor_speed):
+            for motor in (1, 2):
+                try:
+                    set_motor_speed(motor, 0)
+                except Exception as exc:
+                    errors.append(f"motor {motor}: {exc}")
+
+    if errors:
+        print("Warning: one or more motor stop commands failed: " + "; ".join(errors))
+
+
+def trigger_gpio_stop():
+    """Latch the GPIO stop and immediately command the motor controller off."""
+    gpio_stop_latched.set()
+    print("GPIO EMERGENCY STOP BUTTON PRESSED: motors disabled.")
+    stop()
+
+
+def release_gpio_stop():
+    """Release GPIO resources used by the emergency stop button."""
+    global gpio_stop_button
+    if gpio_stop_button is not None:
+        gpio_stop_button.close()
+        gpio_stop_button = None
+
+
+class Camera:
+    """Raspberry Pi 5 camera wrapper with an OpenCV fallback."""
+
+    def __init__(self, camera_id=0, backend="auto"):
+        self.backend = None
+        self.camera = None
+
+        if backend in ("auto", "picamera2") and Picamera2 is not None:
+            camera = None
+            try:
+                camera = Picamera2(camera_id)
+                config = camera.create_preview_configuration(
+                    main={
+                        "size": (CAMERA_WIDTH, CAMERA_HEIGHT),
+                        "format": "BGR888",
+                    }
+                )
+                camera.configure(config)
+                camera.start()
+                self.camera = camera
+                self.backend = "picamera2"
+                time.sleep(0.5)
+                return
+            except Exception as exc:
+                if camera is not None:
+                    try:
+                        camera.close()
+                    except Exception as close_exc:
+                        print(
+                            "Warning: failed to close Picamera2 after "
+                            f"initialization error: {close_exc}"
+                        )
+                if backend == "picamera2":
+                    raise
+                print(
+                    "Warning: Picamera2 initialization failed; falling back "
+                    f"to OpenCV VideoCapture. Error: {exc}"
+                )
+
+        if backend == "picamera2":
+            raise RuntimeError(
+                "Picamera2 is not installed. Install python3-picamera2 on "
+                "Raspberry Pi OS."
+            )
+
+        camera = cv2.VideoCapture(camera_id)
+        camera.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+        camera.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+        self.camera = camera
+        self.backend = "opencv"
+
+    def is_opened(self):
+        """Return whether the selected camera backend initialized."""
+        if self.backend == "picamera2":
+            return self.camera is not None
+        return self.camera.isOpened()
+
+    def read(self):
+        """Return an OpenCV-style ``(success, BGR frame)`` pair."""
+        if self.backend == "picamera2":
+            try:
+                return True, self.camera.capture_array("main")
+            except Exception as exc:
+                print(f"Warning: Picamera2 frame capture failed: {exc}")
+                return False, None
+        return self.camera.read()
+
+    def release(self):
+        """Release the selected camera backend."""
+        if self.camera is None:
+            return
+        if self.backend == "picamera2":
+            self.camera.stop()
+            self.camera.close()
+        else:
+            self.camera.release()
+        self.camera = None
 
 
 def drive(speed, steering_angle):
@@ -140,14 +292,19 @@ def drive(speed, steering_angle):
         )
         return
 
-    px.set_dir_servo_angle(steering_angle)
+    with motor_lock:
+        if gpio_stop_latched.is_set():
+            stop()
+            return
 
-    if speed > 0:
-        px.forward(speed)
-    elif speed < 0:
-        px.backward(abs(speed))
-    else:
-        px.stop()
+        px.set_dir_servo_angle(steering_angle)
+
+        if speed > 0:
+            px.forward(speed)
+        elif speed < 0:
+            px.backward(abs(speed))
+        else:
+            stop()
 
 
 def get_distance_cm():
@@ -334,29 +491,50 @@ def parse_args():
             "while printing intended motor commands without moving motors."
         ),
     )
+    parser.add_argument(
+        "--camera-backend",
+        choices=("auto", "picamera2", "opencv"),
+        default="auto",
+        help="Use Picamera2 on Raspberry Pi 5, or OpenCV for a USB camera.",
+    )
+    parser.add_argument(
+        "--stop-gpio",
+        type=int,
+        default=None,
+        metavar="BCM_PIN",
+        help=(
+            "BCM GPIO connected to a normally-open GPIO emergency stop button "
+            "whose other terminal is connected to ground."
+        ),
+    )
     return parser.parse_args()
 
 
 def main():
     """Run the autonomous driving loop until the user stops the program."""
     args = parse_args()
-    init_robot(dry_run=args.dry_run)
+    init_robot(dry_run=args.dry_run, stop_gpio=args.stop_gpio)
 
-    cap = cv2.VideoCapture(CAMERA_ID)
-
-    if not cap.isOpened():
-        print(
-            f"Could not open camera with CAMERA_ID={CAMERA_ID}. "
-            "Check the camera connection, enable the Raspberry Pi camera if "
-            "needed, or try changing CAMERA_ID to 1."
-        )
-        return
-
+    cap = None
     last_stop_time = 0
     last_right_time = 0
 
     try:
+        cap = Camera(CAMERA_ID, backend=args.camera_backend)
+        if not cap.is_opened():
+            print(
+                f"Could not open camera with CAMERA_ID={CAMERA_ID}. "
+                "Check the camera connection, enable the Raspberry Pi camera if "
+                "needed, or try changing CAMERA_ID to 1."
+            )
+            return
+
         while True:
+            if gpio_stop_latched.is_set():
+                stop()
+                print("GPIO emergency stop is latched; exiting autonomous mode.")
+                break
+
             ret, frame = cap.read()
 
             if not ret:
@@ -424,7 +602,9 @@ def main():
 
     finally:
         stop()
-        cap.release()
+        release_gpio_stop()
+        if cap is not None:
+            cap.release()
         cv2.destroyAllWindows()
         print("Motors stopped, camera released, and OpenCV windows closed.")
 
