@@ -66,6 +66,7 @@ shared_state = {
     "fault": None,
     "raw_jpeg": None,
     "mask_jpeg": None,
+    "latest_frame": None,
     "thresholds": DEFAULT_THRESHOLDS.copy(),
 }
 
@@ -86,6 +87,7 @@ def init_robot(dry_run=False, stop_gpio=None):
             "fault": None,
             "raw_jpeg": None,
             "mask_jpeg": None,
+            "latest_frame": None,
             "thresholds": DEFAULT_THRESHOLDS.copy(),
         })
 
@@ -448,6 +450,45 @@ def detect_lane(frame, thresholds=None):
     return error, mask
 
 
+def calibrate_lane_thresholds(frame):
+    """Estimate white-lane HSV thresholds from the lower camera ROI."""
+    h, _, _ = frame.shape
+    roi = frame[int(h * 0.55):h, :]
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+    candidate_mask = (hsv[:, :, 2] > 120) & (hsv[:, :, 1] < 120)
+    candidate_pixels = hsv[candidate_mask]
+    minimum_pixels = max(100, int(roi.shape[0] * roi.shape[1] * 0.001))
+    if len(candidate_pixels) < minimum_pixels:
+        raise ValueError(
+            "Could not find enough bright low-saturation lane pixels. "
+            "Improve lighting or reposition the car."
+        )
+
+    hue = candidate_pixels[:, 0]
+    saturation = candidate_pixels[:, 1]
+    value = candidate_pixels[:, 2]
+
+    h_min = max(0, int(np.percentile(hue, 5)) - 10)
+    h_max = min(180, int(np.percentile(hue, 95)) + 10)
+    if h_max - h_min < 20:
+        h_min, h_max = 0, 180
+
+    thresholds = {
+        "h_min": h_min,
+        "h_max": h_max,
+        "s_min": max(0, int(np.percentile(saturation, 5)) - 20),
+        "s_max": min(255, int(np.percentile(saturation, 95)) + 20),
+        "v_min": max(0, int(np.percentile(value, 5)) - 20),
+        "v_max": 255,
+    }
+
+    thresholds["h_min"] = min(thresholds["h_min"], thresholds["h_max"])
+    thresholds["s_min"] = min(thresholds["s_min"], thresholds["s_max"])
+    thresholds["v_min"] = min(thresholds["v_min"], thresholds["v_max"])
+    return thresholds
+
+
 # -----------------------------------------------------------------------------
 # Vision: traffic sign detection
 # -----------------------------------------------------------------------------
@@ -520,8 +561,8 @@ DASHBOARD_HTML = """
 body{font-family:system-ui,sans-serif;margin:0;background:#111827;color:#f9fafb}main{max-width:1050px;margin:auto;padding:20px}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}.card{background:#1f2937;padding:16px;border-radius:10px}
 img{width:100%;background:#000;border-radius:6px}.status{display:grid;grid-template-columns:1fr 1fr;gap:8px}.status div{background:#374151;padding:8px;border-radius:5px}
-button{padding:12px 16px;margin:4px;border:0;border-radius:5px;font-weight:700;cursor:pointer}.start{background:#22c55e}.stop{background:#f59e0b}.emergency{background:#ef4444;color:white}
-label{display:grid;grid-template-columns:80px 1fr 45px;gap:8px;margin:8px 0;align-items:center}input{width:100%}.latched{color:#f87171;font-weight:700}
+button{padding:12px 16px;margin:4px;border:0;border-radius:5px;font-weight:700;cursor:pointer}.start{background:#22c55e}.stop{background:#f59e0b}.emergency{background:#ef4444;color:white}.calibrate{background:#60a5fa}
+label{display:grid;grid-template-columns:80px 1fr 45px;gap:8px;margin:8px 0;align-items:center}input{width:100%}.latched,.message.error{color:#f87171;font-weight:700}.message.success{color:#4ade80;font-weight:700}
 </style></head><body><main><h1>PiCar Live Dashboard</h1>
 <p>Driving starts disabled. Test with the car lifted on blocks.</p><div class="grid">
 <section class="card"><h2>Camera</h2><img src="/video_feed" alt="Live camera"></section>
@@ -534,13 +575,21 @@ label{display:grid;grid-template-columns:80px 1fr 45px;gap:8px;margin:8px 0;alig
 <p><button class="start" onclick="post('/api/start')">Start autonomous driving</button>
 <button class="stop" onclick="post('/api/stop')">Stop autonomous driving</button>
 <button class="emergency" onclick="post('/api/emergency_stop')">EMERGENCY STOP</button></p></section>
-<section class="card"><h2>Lane HSV thresholds</h2><div id="sliders"></div></section></div>
+<section class="card"><h2>Lane HSV thresholds</h2><div id="sliders"></div>
+<p><button class="calibrate" onclick="calibrateLane()">Calibrate lane threshold</button></p>
+<p id="calibration_status" class="message" role="status" aria-live="polite"></p></section></div>
 <script>
 const defs=[['h_min','H min',0,180],['h_max','H max',0,180],['s_min','S min',0,255],['s_max','S max',0,255],['v_min','V min',0,255],['v_max','V max',0,255]];
 const sliders=document.getElementById('sliders');
 for(const [key,name,min,max] of defs){sliders.insertAdjacentHTML('beforeend',`<label>${name}<input id="${key}" type="range" min="${min}" max="${max}"><output id="${key}_out"></output></label>`);const el=document.getElementById(key);el.oninput=()=>{document.getElementById(key+'_out').value=el.value; updateConfig();};}
 let timer; function updateConfig(){clearTimeout(timer);timer=setTimeout(()=>post('/api/config',Object.fromEntries(defs.map(([k])=>[k,Number(document.getElementById(k).value)]))),100);}
 async function post(url,data){await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:data?JSON.stringify(data):null});refresh();}
+async function calibrateLane(){const status=document.getElementById('calibration_status');status.className='message';status.textContent='Calibrating from current frame...';
+try{const response=await fetch('/api/calibrate_lane',{method:'POST'});const result=await response.json();
+if(!response.ok||!result.ok){throw new Error(result.error||'Calibration failed.');}
+for(const [key] of defs){document.getElementById(key).value=result.thresholds[key];document.getElementById(key+'_out').value=result.thresholds[key];}
+status.className='message success';status.textContent=result.message;
+}catch(err){status.className='message error';status.textContent=err.message;}}
 let initialized=false;async function refresh(){const s=await fetch('/api/status').then(r=>r.json());
 distance.textContent=s.distance_cm==null?'unavailable':s.distance_cm.toFixed(1)+' cm';sign.textContent=s.detected_sign||'none';error.textContent=s.lane_error==null?'none':s.lane_error;steering.textContent=s.steering.toFixed(1);active.textContent=s.autonomous_active?'ON':'OFF';emergency.textContent=s.emergency_stop?'LATCHED':'clear';emergency.className=s.emergency_stop?'latched':'';fault.textContent=s.fault||'none';
 if(!initialized){for(const [k] of defs){document.getElementById(k).value=s.thresholds[k];document.getElementById(k+'_out').value=s.thresholds[k];}initialized=true;}}
@@ -614,10 +663,66 @@ def create_web_app():
             shared_state["thresholds"] = updated
         return flask.jsonify(ok=True, thresholds=updated)
 
+    @app.post("/api/calibrate_lane")
+    def calibrate_lane():
+        with state_lock:
+            if gpio_stop_latched.is_set():
+                return flask.jsonify(
+                    ok=False,
+                    error="Emergency stop is latched. Calibration is disabled.",
+                ), 409
+            if shared_state["autonomous_active"]:
+                return flask.jsonify(
+                    ok=False,
+                    error="Stop autonomous driving before calibrating.",
+                ), 409
+            frame = shared_state["latest_frame"]
+            if frame is None:
+                return flask.jsonify(
+                    ok=False,
+                    error="No camera frame is available yet. Wait for the live feed.",
+                ), 503
+            frame = frame.copy()
+
+        try:
+            thresholds = calibrate_lane_thresholds(frame)
+        except (ValueError, cv2.error) as exc:
+            return flask.jsonify(ok=False, error=str(exc)), 422
+
+        error, lane_mask = detect_lane(frame, thresholds)
+        mask_ok, mask_buffer = cv2.imencode(".jpg", lane_mask)
+        with state_lock:
+            # Recheck safety state before applying a result calculated outside
+            # the lock, in case driving or the emergency stop began meanwhile.
+            if gpio_stop_latched.is_set():
+                return flask.jsonify(
+                    ok=False,
+                    error="Emergency stop was latched during calibration.",
+                ), 409
+            if shared_state["autonomous_active"]:
+                return flask.jsonify(
+                    ok=False,
+                    error="Autonomous driving started during calibration.",
+                ), 409
+            shared_state["thresholds"] = thresholds
+            shared_state["lane_error"] = error
+            if mask_ok:
+                shared_state["mask_jpeg"] = mask_buffer.tobytes()
+
+        return flask.jsonify(
+            ok=True,
+            thresholds=thresholds,
+            message="Lane threshold calibrated from current frame.",
+        )
+
     @app.get("/api/status")
     def status():
         with state_lock:
-            data = {key: value for key, value in shared_state.items() if key not in ("raw_jpeg", "mask_jpeg")}
+            data = {
+                key: value
+                for key, value in shared_state.items()
+                if key not in ("raw_jpeg", "mask_jpeg", "latest_frame")
+            }
             data["emergency_stop"] = gpio_stop_latched.is_set()
         return flask.jsonify(data)
 
@@ -779,6 +884,7 @@ def main():
                     "lane_error": error,
                     "raw_jpeg": raw_buffer.tobytes() if raw_ok else None,
                     "mask_jpeg": mask_buffer.tobytes() if mask_ok else None,
+                    "latest_frame": frame.copy(),
                 })
 
             if distance is None:
