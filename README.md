@@ -101,6 +101,10 @@ Use this order the first time you set up a car or after changing wiring, camera 
 
 Dry-run mode runs the camera loop, lane detection, sign detection, and ultrasonic distance read when the PiCar library and sensor are available. It prints the motor and steering commands it would send, but it does not move the motors or steering servo.
 
+If ultrasonic hardware is unavailable in dry-run mode, the script reports the
+missing distance and continues the vision pipeline. The repeated-read fail-safe
+stop applies only when the car is running with real motor control.
+
 ```bash
 python3 autonomous_picar_mvp.py --dry-run
 ```
@@ -340,3 +344,9 @@ Different kits may mount motors or servos differently. Check the PiCar library d
 - Increase `OBSTACLE_LIMIT_CM`.
 - Test the ultrasonic sensor separately.
 - Remember that ultrasonic sensors may miss angled or soft surfaces.
+- Readings such as `-1` or `-2` are sensor/library error sentinels, not real
+  negative distances. The autonomous script tolerates up to two transient
+  invalid readings, but stops on the third consecutive invalid reading because
+  obstacle detection can no longer be trusted. If failures repeat, check the
+  ultrasonic sensor's power, trigger, and echo connections, then run
+  `python3 hardware_check.py`.
