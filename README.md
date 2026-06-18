@@ -145,7 +145,10 @@ Run it with:
 python3 calibrate_vision.py
 ```
 
-The terminal prints `red_area`, `blue_area`, and `lane_error`. Use those values to tune sign size, lighting, camera angle, lane tape, and HSV thresholds. Press **q** in an OpenCV window or **CTRL+C** in the terminal to stop.
+The terminal prints `red_area`, `blue_area`, `blue_ratio`,
+`blue_contour`, `blue_valid`, and `lane_error`. Use those values to tune sign
+size, lighting, camera angle, lane tape, and HSV thresholds. Press **q** in an
+OpenCV window or **CTRL+C** in the terminal to stop.
 
 ## What the Project Does
 
@@ -277,7 +280,13 @@ Configuration values are near the top of `autonomous_picar_mvp.py`.
 | `OBSTACLE_LIMIT_CM` | Stop distance for obstacles | Increase for more safety margin. |
 | `STOP_COOLDOWN` | Seconds before another STOP sign response | Increase if the car repeatedly stops for the same sign. |
 | `RIGHT_COOLDOWN` | Seconds before another RIGHT TURN response | Increase if the same sign triggers multiple turns. |
-| `SIGN_AREA_THRESHOLD` | Minimum red/blue mask area for sign detection | Increase to reduce false detections; decrease if signs are missed. |
+| `SIGN_AREA_THRESHOLD` | Minimum red mask area for STOP detection | Increase to reduce false STOP detections; decrease if STOP signs are missed. |
+| `BLUE_HSV_LOWER`, `BLUE_HSV_UPPER` | Saturation, brightness, and hue range accepted as blue | Narrow this range if non-sign objects enter the blue mask. |
+| `BLUE_MIN_CONTOUR_AREA` | Minimum largest-contour area for a RIGHT sign | Raise it to reject small blue objects; lower it carefully for distant signs. |
+| `BLUE_MAX_ROI_RATIO` | Maximum fraction of the sign ROI that may be blue (`0.08` by default) | Lower it to reject large background-like blue masks; raise it cautiously only if a nearby real sign is rejected. |
+| `BLUE_MIN_FILL_RATIO` | Minimum contour-to-bounding-box fill | Raise it to reject sparse or irregular regions. |
+| `BLUE_MIN_ASPECT_RATIO`, `BLUE_MAX_ASPECT_RATIO` | Allowed sign bounding-box proportions | Tighten the range to match the printed signs used on the track. |
+| `BLUE_MIN_WIDTH`, `BLUE_MIN_HEIGHT` | Minimum sign bounding-box dimensions | Raise these to reject tiny blue objects. |
 
 Tune one value at a time and write down the result. Lighting, camera angle, lane tape color, sign size, and speed all affect behavior.
 
@@ -330,13 +339,22 @@ Different kits may mount motors or servos differently. Check the PiCar library d
 - Move signs closer to the camera.
 - Make signs larger and more saturated.
 - Improve lighting.
-- Lower `SIGN_AREA_THRESHOLD` gradually.
-- Adjust the HSV thresholds in `detect_sign()` for your printed signs.
+- For STOP signs, lower `SIGN_AREA_THRESHOLD` gradually.
+- For RIGHT signs, tune `BLUE_HSV_LOWER`, `BLUE_HSV_UPPER`,
+  `BLUE_MIN_CONTOUR_AREA`, and the blue shape limits near the top of
+  `autonomous_picar_mvp.py`.
 
 ### False sign detections happen
 
 - Remove red and blue clutter from the background.
-- Increase `SIGN_AREA_THRESHOLD`.
+- If blue is detected constantly, check the lighting and background, then
+  tighten `BLUE_HSV_LOWER` and `BLUE_HSV_UPPER` for the printed sign.
+- Blue detection rejects masks covering too much of the ROI as
+  background-like. Watch `blue_ratio`, `blue_contour`, `blue_box`,
+  `blue_aspect`, `blue_fill`, `blue_center`, and `blue_valid` in dry-run logs
+  to see which check rejected a candidate. With the default
+  `BLUE_MAX_ROI_RATIO` of `0.08`, a ratio such as `0.09` is rejected.
+- Increase `SIGN_AREA_THRESHOLD` only for false red STOP detections.
 - Use a simpler test area with consistent lighting.
 
 ### Obstacle stopping is unreliable
