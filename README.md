@@ -393,3 +393,64 @@ public internet. A browser button and GPIO callback are software safety aids,
 not replacements for a physical motor-power disconnect. If camera capture
 fails, the program disables autonomous driving and latches the emergency state;
 if the main loop or web server exits, the cleanup path calls `stop()`.
+
+## Optional Voice Control
+
+Voice control adds two deliberately limited commands:
+
+- `picar start`
+- `picar stop`
+
+The word `picar` is required as a wake word. Other phrases are ignored, and
+there is no voice command that clears or operates the emergency-stop latch.
+Voice start is rejected while an emergency stop or active safety fault exists.
+Voice stop is always allowed and immediately calls the motor stop function.
+When voice mode starts, autonomous driving remains **off** until a valid start
+command is heard.
+
+Install the local speaker command and microphone dependencies on Raspberry Pi
+OS:
+
+```bash
+sudo apt update
+sudo apt install espeak
+sudo apt install python3-pyaudio portaudio19-dev
+python3 -m pip install SpeechRecognition pyaudio
+```
+
+`espeak` provides non-blocking local spoken feedback such as `Starting` and
+`Stopping`. If it is unavailable, the same feedback is printed instead. Speech
+recognition uses the `SpeechRecognition` package's default Google recognizer,
+so recognizing commands requires an internet connection. No cloud
+text-to-speech is used.
+
+List microphone names and indexes before selecting an input:
+
+```bash
+python3 autonomous_picar_mvp.py --list-mics
+```
+
+Run the dashboard and voice listener together:
+
+```bash
+python3 autonomous_picar_mvp.py --web --voice
+```
+
+Select a microphone by the index printed by `--list-mics`:
+
+```bash
+python3 autonomous_picar_mvp.py --web --voice --voice-device-index 1
+```
+
+For the first voice test, put the car on stable blocks with all wheels clear of
+the floor and use dry-run mode:
+
+```bash
+python3 autonomous_picar_mvp.py --dry-run --web --voice
+```
+
+In dry-run mode, voice commands, dashboard state changes, and speaker feedback
+still work, while motor and steering commands are only printed. Recognition can
+be affected by room noise, microphone quality, pronunciation, and network
+availability. Voice control is a convenience feature, not a replacement for
+the web/GPIO stop controls or a physical motor-power disconnect.

@@ -14,6 +14,8 @@ Raspberry Pi hardware. See README.md for setup and safety notes.
 import argparse
 import importlib
 import math
+import shutil
+import subprocess
 import threading
 import time
 
@@ -47,6 +49,7 @@ motor_lock = threading.RLock()
 state_lock = threading.RLock()
 web_server_failed = threading.Event()
 flask = None
+speech_recognition = None
 
 DEFAULT_THRESHOLDS = {
     "h_min": 0,
@@ -234,6 +237,54 @@ def latch_emergency_stop(reason):
         shared_state["steering"] = 0.0
         shared_state["fault"] = reason
     stop()
+
+
+def speak(message):
+    """Speak a short message without blocking, or print it if espeak is absent."""
+    if shutil.which("espeak") is None:
+        print(f"Speech: {message}")
+        return
+    try:
+        subprocess.Popen(
+            ["espeak", message],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        print(f"Speech: {message} (could not start espeak: {exc})")
+
+
+def request_start(source):
+    """Enable autonomous driving when all current safety checks allow it."""
+    with state_lock:
+        if gpio_stop_latched.is_set():
+            reason = "Emergency stop is active"
+        elif shared_state["fault"]:
+            reason = f"Cannot start: {shared_state['fault']}"
+        else:
+            shared_state["autonomous_active"] = True
+            reason = None
+
+    if reason is not None:
+        print(f"{source} start rejected: {reason}")
+        if source == "voice":
+            speak(reason)
+        return False, reason
+
+    print(f"Autonomous driving started by {source}.")
+    speak("Starting")
+    return True, None
+
+
+def request_stop(source):
+    """Disable autonomous driving and immediately stop the motors."""
+    with state_lock:
+        shared_state["autonomous_active"] = False
+        shared_state["steering"] = 0.0
+    stop()
+    print(f"Autonomous driving stopped by {source}.")
+    speak("Stopping")
+    return True, None
 
 
 def release_gpio_stop():
@@ -629,19 +680,14 @@ def create_web_app():
 
     @app.post("/api/start")
     def start_autonomous():
-        with state_lock:
-            if gpio_stop_latched.is_set():
-                return flask.jsonify(ok=False, error="Emergency stop is latched"), 409
-            shared_state["autonomous_active"] = True
-            shared_state["fault"] = None
+        ok, error = request_start("web")
+        if not ok:
+            return flask.jsonify(ok=False, error=error), 409
         return flask.jsonify(ok=True)
 
     @app.post("/api/stop")
     def stop_autonomous():
-        with state_lock:
-            shared_state["autonomous_active"] = False
-            shared_state["steering"] = 0.0
-        stop()
+        request_stop("web")
         return flask.jsonify(ok=True)
 
     @app.post("/api/emergency_stop")
@@ -753,6 +799,92 @@ def load_flask():
 
 
 # -----------------------------------------------------------------------------
+# Optional voice control
+# -----------------------------------------------------------------------------
+
+def load_voice_dependencies():
+    """Load SpeechRecognition only when microphone features are requested."""
+    global speech_recognition
+    try:
+        speech_recognition = importlib.import_module("speech_recognition")
+        importlib.import_module("pyaudio")
+    except ImportError as exc:
+        raise RuntimeError(
+            "Voice control requires SpeechRecognition and PyAudio. Install "
+            "them with 'sudo apt install python3-pyaudio portaudio19-dev' and "
+            "'python3 -m pip install SpeechRecognition pyaudio'."
+        ) from exc
+
+
+def list_microphones():
+    """Print microphone device indexes understood by SpeechRecognition."""
+    load_voice_dependencies()
+    try:
+        names = speech_recognition.Microphone.list_microphone_names()
+    except (AttributeError, OSError, ValueError) as exc:
+        raise RuntimeError(
+            "Could not list microphones. Install PyAudio and PortAudio, then "
+            f"check that an audio input device is connected. Original error: {exc}"
+        ) from exc
+    if not names:
+        print("No microphones were found.")
+        return
+    for index, name in enumerate(names):
+        print(f"{index}: {name}")
+
+
+def run_voice_listener(device_index=None):
+    """Listen for the minimal wake-word commands in a background thread."""
+    recognizer = speech_recognition.Recognizer()
+    try:
+        microphone = speech_recognition.Microphone(device_index=device_index)
+        with microphone as source:
+            print("Voice control: adjusting for ambient noise...")
+            recognizer.adjust_for_ambient_noise(source, duration=1)
+    except (AttributeError, OSError, ValueError) as exc:
+        print(
+            "Voice control could not open the microphone. Check --list-mics, "
+            "install PyAudio/PortAudio, and select --voice-device-index if "
+            f"needed. Original error: {exc}"
+        )
+        return
+
+    print("Voice control ready. Say 'picar start' or 'picar stop'.")
+    while True:
+        try:
+            with microphone as source:
+                audio = recognizer.listen(
+                    source,
+                    timeout=1,
+                    phrase_time_limit=3,
+                )
+            command = recognizer.recognize_google(audio).lower().strip()
+            print(f"Voice heard: {command}")
+            words = command.split()
+            if "picar" not in words:
+                continue
+            wake_index = words.index("picar")
+            command_words = words[wake_index + 1:]
+            if command_words == ["start"]:
+                request_start("voice")
+            elif command_words == ["stop"]:
+                request_stop("voice")
+        except speech_recognition.WaitTimeoutError:
+            continue
+        except speech_recognition.UnknownValueError:
+            continue
+        except speech_recognition.RequestError as exc:
+            print(
+                "Voice recognition service error. The default Google "
+                f"recognizer requires internet access. Error: {exc}"
+            )
+            time.sleep(2)
+        except OSError as exc:
+            print(f"Voice microphone error: {exc}")
+            time.sleep(2)
+
+
+# -----------------------------------------------------------------------------
 # Sign behaviors
 # -----------------------------------------------------------------------------
 
@@ -801,6 +933,23 @@ def parse_args():
         help="Run the live Flask dashboard on port 5000; driving starts stopped.",
     )
     parser.add_argument(
+        "--voice",
+        action="store_true",
+        help="Enable background voice control for 'picar start' and 'picar stop'.",
+    )
+    parser.add_argument(
+        "--voice-device-index",
+        type=int,
+        default=None,
+        metavar="INDEX",
+        help="Select the microphone index used by --voice.",
+    )
+    parser.add_argument(
+        "--list-mics",
+        action="store_true",
+        help="List microphone device indexes and exit.",
+    )
+    parser.add_argument(
         "--camera-backend",
         choices=("auto", "picamera2", "opencv"),
         default="auto",
@@ -822,6 +971,11 @@ def parse_args():
 def main():
     """Run the autonomous driving loop until the user stops the program."""
     args = parse_args()
+    if args.list_mics:
+        list_microphones()
+        return
+    if args.voice:
+        load_voice_dependencies()
     init_robot(dry_run=args.dry_run, stop_gpio=args.stop_gpio)
 
     cap = None
@@ -843,7 +997,14 @@ def main():
             load_flask()
             threading.Thread(target=run_web_server, name="picar-web", daemon=True).start()
             print("Web dashboard: http://<raspberry-pi-ip>:5000")
-        else:
+        if args.voice:
+            threading.Thread(
+                target=run_voice_listener,
+                args=(args.voice_device_index,),
+                name="picar-voice",
+                daemon=True,
+            ).start()
+        if not args.web and not args.voice:
             with state_lock:
                 shared_state["autonomous_active"] = True
 
