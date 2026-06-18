@@ -17,7 +17,9 @@ The main script, `autonomous_picar_mvp.py`, uses:
 Run these commands from the repository directory on your Raspberry Pi:
 
 ```bash
-python3 -m venv .venv
+sudo apt update
+sudo apt install python3-picamera2 python3-gpiozero python3-lgpio python3-opencv python3-numpy
+python3 -m venv --system-site-packages .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 python3 -c "from picarx import Picarx; print('picarx is installed')"
@@ -27,6 +29,45 @@ python3 autonomous_picar_mvp.py
 ```
 
 Stop the program at any time with **CTRL+C**. If a display window is open, you can also press **q** while the OpenCV window is focused.
+
+## Raspberry Pi 5 Setup
+
+Raspberry Pi 5 uses the libcamera camera stack. Install the OS-provided
+Picamera2 and GPIO packages before creating the virtual environment:
+
+```bash
+sudo apt update
+sudo apt install python3-picamera2 python3-gpiozero python3-lgpio python3-opencv python3-numpy
+python3 -m venv --system-site-packages .venv
+```
+
+The default `--camera-backend auto` mode prefers Picamera2 for a CSI-connected
+Raspberry Pi camera and falls back to OpenCV for USB cameras. A backend can also
+be selected explicitly:
+
+```bash
+python3 autonomous_picar_mvp.py --camera-backend picamera2
+python3 autonomous_picar_mvp.py --camera-backend opencv
+```
+
+## GPIO Emergency Stop Button
+
+For a software-mediated stop that does not depend on the camera loop, connect a
+normally-open momentary switch between an unused BCM GPIO pin and ground. For
+example, with BCM GPIO 17:
+
+```bash
+python3 autonomous_picar_mvp.py --stop-gpio 17
+```
+
+Pressing the switch invokes a GPIO callback immediately, latches the stop state,
+and sends the PiCar-X `stop()` command. If the installed PiCar-X library exposes
+`set_motor_speed`, the callback also sends explicit zero-speed commands to both
+motor channels. The process then exits; restart it only after checking the cause
+of the stop.
+
+This GPIO button is still software-mediated. It supplements, but does not
+replace, a physical power-disconnect switch that directly removes motor power.
 
 
 ## Safe First-Run Procedure
@@ -159,7 +200,7 @@ python3 -m pip list | grep -i picar
 Recommended setup:
 
 ```bash
-python3 -m venv .venv
+python3 -m venv --system-site-packages .venv
 source .venv/bin/activate
 python3 -m pip install --upgrade pip
 pip install -r requirements.txt
@@ -244,7 +285,9 @@ Tune one value at a time and write down the result. Lighting, camera angle, lane
 - The right turn is a timed maneuver, not a mapped path.
 - Camera exposure, shadows, and glare can significantly change results.
 - Ultrasonic readings can be noisy or unreliable on soft, angled, or narrow objects.
-- The code assumes the `picarx` API provides `Picarx`, `forward`, `backward`, `stop`, `set_dir_servo_angle`, and `ultrasonic.read()`.
+- The code assumes the `picarx` API provides `Picarx`, `forward`, `backward`,
+  `stop`, `set_dir_servo_angle`, and `ultrasonic.read()`. If
+  `set_motor_speed` is available, it is used as an additional stop command.
 
 ## Troubleshooting
 

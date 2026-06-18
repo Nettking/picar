@@ -3,7 +3,7 @@
 import cv2
 import numpy as np
 
-from autonomous_picar_mvp import CAMERA_ID, detect_lane
+from autonomous_picar_mvp import CAMERA_ID, Camera, detect_lane
 
 
 def make_sign_masks(frame):
@@ -22,8 +22,8 @@ def make_sign_masks(frame):
 
 def main():
     """Show camera, lane mask, red mask, and blue mask until q is pressed."""
-    cap = cv2.VideoCapture(CAMERA_ID)
-    if not cap.isOpened():
+    cap = Camera(CAMERA_ID)
+    if not cap.is_opened():
         print(f"Could not open camera with CAMERA_ID={CAMERA_ID}.")
         return
 
